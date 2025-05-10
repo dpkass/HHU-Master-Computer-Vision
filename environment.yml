@@ -1,0 +1,17 @@
+name: computer-vision
+channels:
+  - conda-forge
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - imageio
+  - matplotlib
+  - napari
+  - numpy
+  - pandas
+  - python
+  - scikit-learn
+  - notebook
+  - pyqt
+prefix: /opt/homebrew/anaconda3/envs/computer-vision
