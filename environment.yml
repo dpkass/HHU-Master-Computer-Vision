@@ -14,4 +14,5 @@ dependencies:
   - scikit-learn
   - notebook
   - pyqt
+  - jupyter
 prefix: /opt/homebrew/anaconda3/envs/computer-vision
