@@ -81,8 +81,8 @@ def eight_point_algorithm(pts):
     def normalize(pts):
         mean = pts.mean(axis=0)
         shifted = pts - mean
-        mean_dist = np.mean(np.sqrt((shifted**2).sum(axis=1)))
-        scale = 2**0.5 / mean_dist
+        mean_dist = np.mean(np.sqrt((shifted ** 2).sum(axis=1)))
+        scale = 2 ** 0.5 / mean_dist
         T = np.array(
             [[scale, 0, -scale * mean[0]], [0, scale, -scale * mean[1]], [0, 0, 1]]
         )
@@ -101,11 +101,11 @@ def eight_point_algorithm(pts):
     return T_right.T @ F_norm @ T_left
 
 
-def rectify(image1, image2, *, logging=True, display=False):
+def rectify(left, right, *, logging=True, display=False):
     log = logger(logging)
 
     extractions = extract_kps_and_calc_transform(
-        image1, image2, logging=logging, display=display
+        left, right, logging=logging, display=display
     )
     kps = extractions["keypoints"]
 
@@ -117,23 +117,28 @@ def rectify(image1, image2, *, logging=True, display=False):
         kps[:, 0],
         kps[:, 1],
         F,
-        (image1.shape[1], image1.shape[0]),
+        (left.shape[1], left.shape[0]),
     )
     log("homography matrices calculated.")
     log("apply homography matrices.")
-    image1_rect = apply_transform(image1, np.linalg.inv(H1))
-    image2_rect = apply_transform(image2, np.linalg.inv(H2))
+    ones = np.ones_like(left, dtype=np.bool)
+    left_rect = apply_transform(left, np.linalg.inv(H1))
+    left_mask = apply_transform(ones, np.linalg.inv(H1))
+    right_rect = apply_transform(right, np.linalg.inv(H2))
+    right_mask = apply_transform(ones, np.linalg.inv(H2))
 
     if display:
         log("display rectified images, with epipolar lines of select keypoints...")
-        display_epipolar_lines(image1_rect, image2, F, H1, kps)
+        display_epipolar_lines(left_rect, right, F, H1, kps)
 
     return extractions | {
         "F": F,
         "H1": H1,
         "H2": H2,
-        "image1_rect": image1_rect,
-        "image2_rect": image2_rect,
+        "left_rect": left_rect,
+        "right_rect": right_rect,
+        "left_mask": left_mask,
+        "right_mask": right_mask,
     }
 
 
@@ -160,12 +165,12 @@ def get_cost_f(cost_f):
     return cost_f
 
 
-def _scanline(left, right, *, cost_f="SAD", block_size=11):
+def scanline(left, right, *, ltr=True, cost_f="SSD", block_size=11):
     cf = get_cost_f(cost_f)
 
     H, W = left.shape
     bs = block_size
-    dmax = W // 10
+    dmax = W // 5
 
     pad = block_size // 2
     left = np.pad(left, ((pad, pad), (pad, pad)), mode="constant")
@@ -177,14 +182,56 @@ def _scanline(left, right, *, cost_f="SAD", block_size=11):
     cost_vol = np.full((H, W, dmax), np.inf)
 
     for d in trange(1, dmax, desc=f"{cost_f} - {bs}"):
-        rp = right_patches[:, d:]
-        lp = left_patches[:, :-d or None]
-        cost_vol[:, :-d or None, d] = cf(lp, rp)
+        if ltr:
+            rp = right_patches[:, d:]
+            lp = left_patches[:, : -d or None]
+            cost_vol[:, : -d or None, d] = cf(lp, rp)
+        else:
+            lp = left_patches[:, d:]
+            rp = right_patches[:, : -d or None]
+            cost_vol[:, d:, d] = cf(lp, rp)
 
-    return cost_vol
+    result = cost_vol.argmin(axis=2)
+    return result if ltr else -result
 
-def scanline(left, right, *, cost_f="SAD", block_size=11):
-    return _scanline(left, right, cost_f=cost_f, block_size=block_size).argmin(axis=2)
+
+def cross_check(left, right, *, left_mask=True, right_mask=True, cost_f='SSD', block_size=11):
+    ltr = scanline(left, right, ltr=True, cost_f=cost_f, block_size=block_size)
+    rtl = scanline(left, right, ltr=False, cost_f=cost_f, block_size=block_size)
+
+    H, W = left.shape
+    rows = np.arange(H)[:, None]
+
+    xl = np.arange(W)
+    xr = xl + ltr
+    assert np.all(xr < W)
+
+    left_match_map = np.isclose(-rtl[rows, xr], ltr, atol=3) & left_mask
+
+    xr = np.arange(W)
+    xl = xr + rtl
+    assert np.all(xl >= 0)
+
+    right_match_map = np.isclose(-ltr[rows, xl], rtl, atol=3) & right_mask
+
+    return {
+        'match_map': left_match_map,
+        'left_match_map': left_match_map,
+        'right_match_map': right_match_map,
+        'ltr': ltr,
+        'rtl': rtl,
+    }
+
+
+def get_cmap(type: str):
+    if type == 'CC':
+        cmap = plt.get_cmap('winter')
+        cmap.set_bad('black')
+    elif 'mask' in type.lower():
+        cmap = None
+    else:
+        cmap = plt.get_cmap('cividis')
+    return cmap
 
 
 def plot_dmaps(dmaps):
@@ -198,41 +245,53 @@ def plot_dmaps(dmaps):
         axes = [[ax] for ax in axes]
 
     for axs, (type, dmaps_bs) in zip(axes, dmaps.items()):
+        cmap = get_cmap(type)
         for ax, (bs, dmap) in zip(axs, dmaps_bs.items()):
-            im = ax.imshow(dmap, cmap="magma")
-            ax.set_title(f"{type} - {bs}")
+            if 'mask' in type.lower():
+                dmap, match = dmap
+                match_str = f", match: {match:1%}"
+                dmin, dmax = False, True
+            else:
+                match_str = ''
+                dmin, dmax = float(np.nanmin(dmap)), float(np.nanmax(dmap))
+
+            im = ax.imshow(dmap, cmap=cmap)
+            ax.set_title(f"{type} (bs: {bs}{match_str})")
             ax.axis("off")
 
             cbar = fig.colorbar(
                 im, ax=ax, orientation="vertical", fraction=0.046, pad=0.04
             )
             cbar.set_label("Disparity (px)", rotation=270, labelpad=15)
-            cbar.set_ticks([dmap.min(), dmap.max()])
-            cbar.set_ticklabels([dmap.min(), dmap.max()])
+            cbar.set_ticks([dmin, dmax])
+            cbar.set_ticklabels([dmin, dmax])
 
     plt.suptitle("Disparity Maps")
     plt.show()
 
 
 def calculate_dmaps(
-    image1,
-    image2,
+    left,
+    right,
     *,
     scale=1 / 4,
+    sad=False,
+    ssd=True,  # faster, but visually equal
+    ncc=False,
+    cc=False,
+    cc_cost_f=('SSD',),
+    block_sizes=(5, 9, 15),
     logging=True,
     display=False,
-    sad=True,
-    ssd=False,
-    ncc=False,
-    block_sizes=(5, 9, 15),
+    display_all=False,
 ):
     log = logger(logging)
 
-    rect_res = rectify(image1, image2, display=display)
-    image1_rect, image2_rect = rect_res["image1_rect"], rect_res["image2_rect"]
+    rect_res = rectify(left, right, logging=logging, display=display_all)
+    left_rect, right_rect = rect_res["left_rect"], rect_res["right_rect"]
 
-    image1_rect_scal, image2_rect_scal = rescale(image1_rect, scale), rescale(
-        image2_rect, scale
+    left_rect_scal, right_rect_scal = rescale(left_rect, scale), rescale(
+        right_rect, scale
     )
 
     disp_maps = defaultdict(dict)
@@ -240,25 +299,41 @@ def calculate_dmaps(
         log("calculate SAD disparity maps.")
         for bs in block_sizes:
             disp_maps["SAD"][bs] = scanline(
-                image1_rect_scal, image2_rect_scal, cost_f="SAD", block_size=bs
+                left_rect_scal, right_rect_scal, cost_f="SAD", block_size=bs
             )
         log("SAD disparity maps calculated.")
     if ssd:
         log("calculate SSD disparity maps.")
         for bs in block_sizes:
             disp_maps["SSD"][bs] = scanline(
-                image1_rect_scal, image2_rect_scal, cost_f="SSD", block_size=bs
+                left_rect_scal, right_rect_scal, cost_f="SSD", block_size=bs
             )
         log("SSD disparity maps calculated.")
     if ncc:
         log("calculate NCC disparity maps.")
         for bs in block_sizes:
             disp_maps["NCC"][bs] = scanline(
-                image1_rect_scal, image2_rect_scal, cost_f="NCC", block_size=bs
+                left_rect_scal, right_rect_scal, cost_f="NCC", block_size=bs
             )
         log("NCC disparity maps calculated.")
+    if cc:
+        log("calculate cross-check match maps.")
+        left_mask = rescale(rect_res["left_mask"], scale)
+        right_mask = rescale(rect_res["right_mask"], scale)
+        for bs in block_sizes:
+            for cost_f in cc_cost_f:
+                result = cross_check(
+                    left_rect_scal, right_rect_scal,
+                    left_mask=left_mask, right_mask=right_mask,
+                    cost_f=cost_f, block_size=bs)
+                dmap = result['ltr'].astype(float)
+                mmap = result['match_map']
+                dmap[~mmap] = np.nan
+                disp_maps[f"CC ({cost_f})"][bs] = dmap
+                disp_maps[f"CC Match Mask ({cost_f})"][bs] = mmap, mmap.sum() / left_mask.sum()
+        log("cross-check match maps calculated.")
 
-    if display:
+    if display or display_all:
         log("display disparity maps...")
         plot_dmaps(disp_maps)
 
